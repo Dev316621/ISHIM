@@ -41,6 +41,12 @@ yarn-error.log*
 /.zscripts/
 /db/*.db
 
+# cloudflare workers build
+/.open-next/
+/.wrangler/
+/.dev.vars
+cloudflare-env.d.ts
+
 # vercel
 .vercel
 
