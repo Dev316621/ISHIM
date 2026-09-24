@@ -1,0 +1,405 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Users & Auth ────────────────────────────────────────────────
+
+model User {
+  id             String       @id @default(cuid())
+  phone          String       @unique
+  email          String?      @unique // set for Google sign-ups
+  googleSub      String?      @unique // Google account id ("sub" claim)
+  name           String
+  address        String? // locality/ward description collected at sign-up
+  role           String       @default("CLIENT") // CLIENT | OWNER | AGENT | ADMIN
+  verified       Boolean      @default(false) // Verified badge (ID / ward member check)
+  banned         Boolean      @default(false)
+  idDoc          String? // local ID / ward member reference
+  whatsappNumber String? // number used for owner contact routing
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  properties   Property[]    @relation("ownerProperties")
+  savedHomes   SavedHome[]
+  contacts     ContactLog[]  @relation("clientContacts")
+  habitEvents  HabitEvent[]  @relation("userHabitEvents")
+  tenancies    Tenancy[]     @relation("userTenancies")
+  agentLinks   AgentOwner[]  @relation("agentLink") // links where user is the agent
+  ownerLinks   AgentOwner[]  @relation("ownerLink") // links where user is the owner
+  agentClients AgentClient[]
+  sessions     Session[]
+  ratings          Rating[]  // ratings this user has given
+  enquiries        Enquiry[] @relation("enquiryRequester") // enquiries raised
+  handledEnquiries Enquiry[] @relation("enquiryHandler")  // enquiries routed to this owner/agent
+  paymentIntents   PaymentIntent[] // pending Cashfree orders raised by this user
+  claimedLeads     ListingLead[] @relation("listingLeadClaims") // no-account listing requests this agent took over
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+}
+
+// ─── Properties ──────────────────────────────────────────────────
+
+model Property {
+  id              String    @id @default(cuid())
+  ownerId         String
+  owner           User      @relation("ownerProperties", fields: [ownerId], references: [id])
+  listedByAgentId String? // agent who bulk-listed on behalf of owner
+  mode            String    @default("HOME") // HOME (residential) | BUSINESS (shops, offices, cafes…)
+  title           String
+  description     String    @default("")
+  block           String // Community block / ward (dynamic via Settings)
+  houseType       String // ASSAM_TYPE | RCC | KUTCHA | APARTMENT
+  rent            Int
+  deposit         Int       @default(0)
+  bedrooms        Int       @default(1)
+  bathrooms       Int       @default(1)
+  amenities       String    @default("[]") // JSON string array (dynamic via Settings)
+  photos          String    @default("[]") // JSON string array of image urls
+  status          String    @default("PENDING") // PENDING | ACTIVE | RENTED | HIDDEN | REJECTED
+  rejectionReason String?
+  kitchen         String? // SEPARATE | SAME_ROOM (kitchen + sleeping room together)
+  areaSqft        Int? // built-up size in square feet
+  widthFt         Int? // plot/house frontage width in feet
+  featured        Boolean   @default(false)
+  negotiable      Boolean   @default(false) // rent is open to negotiation
+  whatsappClicks  Int       @default(0)
+  calls           Int       @default(0) // call-button clicks
+  views           Int       @default(0)
+  contactRoute    String    @default("OWNER") // OWNER | AGENT (agent can route leads to self)
+  feePaid         Boolean   @default(false)
+  feeWaived       Boolean   @default(false)
+  feeAmount       Int?
+  rentedAt        DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  savedBy  SavedHome[]
+  contacts ContactLog[]
+  payments Payment[]
+  paymentIntents PaymentIntent[]
+  habitEvents HabitEvent[] @relation("propertyHabitEvents")
+  tenancies   Tenancy[]    @relation("propertyTenancies")
+  enquiries   Enquiry[]
+
+  @@index([status, createdAt]) // search/browse: filter ACTIVE, sort newest
+  @@index([status, rent]) // rent-sorted search
+  @@index([block, status]) // browse by community block
+  @@index([ownerId]) // owner dashboards & my-listings
+  @@index([listedByAgentId]) // agent-maintained listings
+  @@index([mode, status, createdAt]) // vertical-filtered browse (homes vs business)
+}
+
+// ─── Ratings: property & agent (owner ratings live on Tenancy) ───
+
+/**
+ * A signed-in user's 1–5 star rating with an optional comment.
+ * Polymorphic target: PROPERTY (targetId = property id) or AGENT
+ * (targetId = the agent's user id). One rating per user per target —
+ * re-rating updates the existing row.
+ */
+model Rating {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  targetType String // PROPERTY | AGENT
+  targetId   String // property id or agent user id
+  rating     Int // 1..5
+  comment    String   @default("")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([userId, targetType, targetId])
+  @@index([targetType, targetId])
+}
+
+// ─── Enquiries: agent-handled leads + inspection visit bookings ──
+
+/**
+ * A tracked enquiry raised from a property page. GENERAL = "ask the agent
+ * to handle it"; VISIT = inspection/checkup booking with a requested slot.
+ * Routed to the listing agent when present, otherwise the owner.
+ * WhatsApp/Call clicks are logged in ContactLog instead — these rows are
+ * for enquiries that need a human to follow up inside iShim.
+ */
+model Enquiry {
+  id          String    @id @default(cuid())
+  propertyId  String
+  property    Property  @relation(fields: [propertyId], references: [id])
+  userId      String?
+  user        User?     @relation("enquiryRequester", fields: [userId], references: [id])
+  handledById String?
+  handler     User?     @relation("enquiryHandler", fields: [handledById], references: [id])
+  kind        String    @default("GENERAL") // GENERAL | VISIT
+  channel     String    @default("AGENT") // AGENT | OWNER (who is handling)
+  name        String    @default("")
+  phone       String    @default("")
+  message     String    @default("")
+  visitAt     DateTime? // requested slot for VISIT enquiries
+  status      String    @default("NEW") // NEW | CONTACTED | SCHEDULED | CLOSED
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([handledById, status])
+  @@index([propertyId])
+}
+
+// ─── Listing leads: no-account intake queue ─────────────────────
+
+/**
+ * A property offer collected WITHOUT an account — a local sends their
+ * details through the quick-list form (or WhatsApp) and an iShim agent
+ * does everything else: calls back, takes photos, fills the real
+ * listing form and publishes. This is the top of the supply funnel
+ * for people who never want a dashboard.
+ */
+model ListingLead {
+  id          String    @id @default(cuid())
+  name        String
+  phone       String // WhatsApp-first contact number (91-prefixed digits)
+  mode        String    @default("HOME") // HOME | BUSINESS
+  block       String    @default("") // area/ward — free text, suggested from Settings blocks
+  rent        Int? // expected monthly rent (optional)
+  details     String    @default("") // free text: rooms, floor, water, furnishing…
+  photos      String    @default("[]") // JSON string array of image urls the requester shared
+  status      String    @default("NEW") // NEW | CLAIMED | LISTED | DISCARDED
+  claimedById String? // agent (or admin) who took over this request
+  claimedBy   User?     @relation("listingLeadClaims", fields: [claimedById], references: [id])
+  propertyId  String? // set once the real listing is published
+  source      String    @default("FORM") // FORM | WHATSAPP | ADMIN
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, createdAt])
+  @@index([claimedById])
+}
+
+// ─── Area requests: "my area is not listed" queue ───────────────
+
+/**
+ * When someone listing a home or shop can't find their area/ward in the
+ * selector, they type it instead. The lead/listing still goes through
+ * (block is stored as free text) and a row lands here so an agent or
+ * admin can add the area to the official Settings list with one tap.
+ * Plain ids everywhere — deliberately independent of User relations.
+ */
+model AreaRequest {
+  id             String   @id @default(cuid())
+  name           String // typed area/ward name (as the requester spelled it)
+  nameKey        String   @default("") // lowercased name — dedupe lookups (SQLite has no case-insensitive where)
+  mode           String   @default("HOME") // HOME | BUSINESS — what they were listing
+  note           String   @default("") // optional context (e.g. which listing triggered it)
+  requesterName  String   @default("")
+  requesterPhone String   @default("")
+  leadId         String? // quick-list lead that carried this area (plain id)
+  source         String   @default("FORM") // FORM (quick list) | LISTING (full form) | ADMIN
+  status         String   @default("NEW") // NEW | ADDED | DISCARDED
+  handledById    String? // staff who added/discarded (plain id)
+  handledByName  String? // denormalized for display
+  blockName      String? // canonical spelling once added to Settings
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([nameKey, status])
+}
+
+model SavedHome {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id])
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, propertyId])
+}
+
+model ContactLog {
+  id         String    @id @default(cuid())
+  userId     String?
+  user       User?     @relation("clientContacts", fields: [userId], references: [id])
+  propertyId String
+  property   Property  @relation(fields: [propertyId], references: [id])
+  message    String
+  createdAt  DateTime  @default(now())
+}
+
+// ─── Tenant stays: occupancy status + owner feedback ─────────────
+
+/**
+ * A tenant's live/past stay at a property. One per (user, property).
+ * The tenant declares whether they still live there (STAYING) or have
+ * moved out, rates the owner (1–5) and leaves a remark that is shown
+ * publicly to future tenants on the property page.
+ */
+model Tenancy {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation("userTenancies", fields: [userId], references: [id])
+  propertyId  String
+  property    Property @relation("propertyTenancies", fields: [propertyId], references: [id])
+  status      String   @default("STAYING") // STAYING | MOVED_OUT
+  ownerRating Int? // 1..5 stars for the owner/landlord
+  remark      String? // note for the next tenants (<= 500 chars)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, propertyId])
+  @@index([propertyId, status])
+  @@index([userId, updatedAt])
+}
+
+// ─── Agent CRM ───────────────────────────────────────────────────
+
+model AgentOwner {
+  id        String      @id @default(cuid())
+  agentId   String
+  agent     User        @relation("agentLink", fields: [agentId], references: [id])
+  ownerId   String
+  owner     User        @relation("ownerLink", fields: [ownerId], references: [id])
+  status    String      @default("ACTIVE") // PENDING | ACTIVE
+  createdAt DateTime    @default(now())
+
+  notes OwnerNote[]
+
+  @@unique([agentId, ownerId])
+}
+
+model OwnerNote {
+  id           String     @id @default(cuid())
+  agentOwnerId String
+  agentOwner   AgentOwner @relation(fields: [agentOwnerId], references: [id])
+  text         String
+  createdAt    DateTime   @default(now())
+}
+
+model AgentClient {
+  id             String   @id @default(cuid())
+  agentId        String
+  agent          User     @relation(fields: [agentId], references: [id])
+  name           String
+  phone          String
+  budgetMin      Int      @default(0)
+  budgetMax      Int      @default(0)
+  preferredBlock String   @default("")
+  preferredType  String   @default("")
+  stage          String   @default("NEW_LEAD") // NEW_LEAD | SITE_VISIT | NEGOTIATING | CLOSED | LOST
+  notes          String   @default("")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+// ─── Payments (Success Fee) ──────────────────────────────────────
+
+model Payment {
+  id         String   @id @default(cuid())
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id])
+  payerId    String
+  amount     Int
+  kind       String   @default("SUCCESS_FEE") // SUCCESS_FEE | WAIVED
+  method     String   @default("UPI")
+  createdAt  DateTime @default(now())
+}
+
+// Pending online payment (Cashfree order) — becomes a Payment row once the
+// gateway confirms PAID (via status polling or the signed webhook).
+model PaymentIntent {
+  id          String    @id @default(cuid())
+  propertyId  String
+  property    Property  @relation(fields: [propertyId], references: [id])
+  payerId     String
+  payer       User      @relation(fields: [payerId], references: [id])
+  amount      Int // server-computed fee snapshot (never trusted from client)
+  kind        String    @default("SUCCESS_FEE")
+  cfOrderId   String    @unique // Cashfree order_id (ishim_...)
+  status      String    @default("PENDING") // PENDING | PAID | FAILED | EXPIRED
+  cfPaymentId String? // Cashfree payment_id once SUCCESS
+  paidAt      DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([propertyId])
+  @@index([payerId])
+}
+
+// ─── Ads (home carousel banners) ─────────────────────────────────
+
+model AdBanner {
+  id        String   @id @default(cuid())
+  kicker    String   @default("") // small chip label above the title
+  title     String
+  body      String   @default("")
+  ctaLabel  String   @default("Learn more")
+  action    String   @default("SEARCH") // SEARCH | LIST | URL
+  actionUrl String   @default("") // used when action = URL
+  image     String // banner image url
+  active    Boolean  @default(true)
+  sortOrder Int      @default(0) // lower shows earlier
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Renter habit / demand analytics ─────────────────────────────
+
+/**
+ * Behavioural events powering the "For you" ranking and the admin/agent
+ * demand reports. block/houseType/rent are denormalized from the property
+ * (or taken from the search filters) so aggregation never needs joins.
+ */
+model HabitEvent {
+  id         String    @id @default(cuid())
+  userId     String?
+  user       User?     @relation("userHabitEvents", fields: [userId], references: [id])
+  deviceId   String    @default("") // anonymous visitor identity (client-generated)
+  kind       String // SEARCH | VIEW | SAVE | CONTACT
+  propertyId String?
+  property   Property? @relation("propertyHabitEvents", fields: [propertyId], references: [id])
+  block      String    @default("")
+  houseType  String    @default("")
+  rent       Int       @default(0) // property rent, or the filter's max/min rent
+  query      String    @default("") // free-text query for SEARCH events
+  createdAt  DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@index([deviceId, createdAt])
+  @@index([kind, createdAt])
+  @@index([block, createdAt])
+}
+
+// ─── System Settings (Admin "God Mode") ─────────────────────────
+
+model Setting {
+  key   String @id
+  value String // JSON encoded
+}
+
+// ─── CMS: admin-editable pages (help / legal) ────────────────────
+
+/**
+ * Admin-editable content pages. `slug` is one of the fixed help keys
+ * ("how" | "about" | "contact" | "support" | "privacy" | "terms" | "policy").
+ * `data` is a JSON blob whose shape is validated per slug. When no row
+ * exists for a slug the built-in default content is displayed instead,
+ * so the site always renders even before any customization.
+ */
+model ContentPage {
+  slug      String   @id
+  title     String
+  data      String // JSON blob, shape validated per slug
+  banner    String   @default("") // optional image url shown at the top
+  visible   Boolean  @default(true) // admin toggle: hidden pages leave the public help menu
+  updatedBy String   @default("") // admin name who last edited
+  updatedAt DateTime @updatedAt
+}
