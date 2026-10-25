@@ -40,12 +40,8 @@ yarn-error.log*
 /download/
 /.zscripts/
 /db/*.db
-
-# cloudflare workers build
-/.open-next/
-/.wrangler/
-/.dev.vars
-cloudflare-env.d.ts
+dev.out.log
+opennext-build.log
 
 # vercel
 .vercel
